@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>停車雷達</title>
+<style>
+:root{--bg:#f3f7fc;--card:#fff;--blue:#1565c0;--ink:#2b2b2b;--mut:#777;--line:#d9e3f0}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Noto Sans TC","PingFang TC",sans-serif;background:var(--bg);color:var(--ink)}
+header{background:var(--blue);color:#fff;padding:14px 16px;position:sticky;top:0;z-index:10}
+header h1{margin:0 0 10px;font-size:20px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+input,select,button{font-size:16px;padding:9px 10px;border-radius:8px;border:1px solid var(--line)}
+input[type=text],input[type=password]{flex:1;min-width:140px}
+button{background:#fff;color:var(--blue);font-weight:700;cursor:pointer;border:none}
+button.sec{background:rgba(255,255,255,.2);color:#fff}
+.filters{margin-top:8px}
+.filters select{background:#fff}
+#keybox{background:#fff;border-bottom:1px solid var(--line);padding:12px 16px;display:none}
+#keybox p{margin:0 0 8px;font-size:14px;color:var(--mut)}
+#keybox button{background:var(--blue);color:#fff}
+#map{height:260px;border-bottom:1px solid var(--line);background:#eee}
+#status{padding:10px 16px;color:var(--mut);font-size:14px}
+ul{list-style:none;margin:0;padding:0 12px 40px}
+li{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px}
+li h3{margin:0 0 4px;font-size:17px}
+.meta{font-size:14px;color:var(--mut);margin:2px 0}
+.tag{display:inline-block;font-size:12px;padding:2px 8px;border-radius:10px;background:#dcebff;color:var(--blue);margin-right:6px}
+.tag.g{background:#dff3e3;color:#1b7a35}
+.price{font-weight:700;color:#b25400}
+.acts{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+.acts a{font-size:14px;text-decoration:none;padding:7px 12px;border-radius:8px;background:var(--blue);color:#fff}
+.acts a.o{background:#fff;color:var(--blue);border:1px solid var(--blue)}
+.note{font-size:12px;color:var(--mut);padding:0 16px 8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🅿️ 停車雷達</h1>
+  <div class="row">
+    <input id="q" type="text" placeholder="輸入地點或停車場名（例：板橋車站、遠東百貨）">
+    <button id="go">搜尋</button>
+    <button id="loc" class="sec">📍 我附近</button>
+  </div>
+  <div class="row filters">
+    <select id="radius">
+      <option value="300">300 公尺內</option>
+      <option value="500" selected>500 公尺內</option>
+      <option value="1000">1 公里內</option>
+      <option value="2000">2 公里內</option>
+    </select>
+    <select id="kind">
+      <option value="">不限類型</option>
+      <option value="open">只看營業中</option>
+      <option value="24h">只看 24 小時</option>
+    </select>
+    <select id="sort">
+      <option value="d">依距離</option>
+      <option value="r">依評價</option>
+    </select>
+  </div>
+</header>
+
+<div id="keybox">
+  <p>請貼上你的 Google Maps API 金鑰（只會存在這個瀏覽器，不會上傳）。需啟用 Maps JavaScript API 與 Places API (New)。</p>
+  <div class="row">
+    <input id="key" type="password" placeholder="AIza...">
+    <button id="savekey">儲存</button>
+  </div>
+</div>
+
+<div id="map"></div>
+<div id="status">按「📍 我附近」或輸入地點開始搜尋</div>
+<div class="note">資料來源：Google 地圖。價格取自 Google 的價位資料，以及簡介／評論中提到的費率（網友說法，可能過時，僅供參考）；Google 沒有的就無法顯示，實際收費以現場告示為準。剩餘車位 Google 不提供。</div>
+<ul id="list"></ul>
+
+<script>
+// 與火鍋雷達相同的金鑰；若要換，改這裡或清空後在頁面貼上
+const API_KEY = "AIzaSyAfdkBzgxSWCzG45MLL6gKA5yqxXZifji8";
+
+const FIELDS = ["displayName","formattedAddress","location","nationalPhoneNumber","rating","userRatingCount",
+  "regularOpeningHours","googleMapsURI","businessStatus","types","primaryType",
+  "priceLevel","priceRange","parkingOptions","reviews","editorialSummary"];
+const LEVEL = {FREE:"免費",INEXPENSIVE:"$ 平價",MODERATE:"$$ 中價",EXPENSIVE:"$$$ 較貴",VERY_EXPENSIVE:"$$$$ 很貴"};
+
+// 收費資訊：1) Google 價位/價格區間 2) 停車選項 3) 從簡介與評論文字挖出的費率（網友提供，僅供參考）
+function priceInfo(p){
+  const out={main:"",po:"",hints:[]};
+  const pr=p.priceRange;
+  if(pr && pr.startPrice){
+    const a=+pr.startPrice.units, b=pr.endPrice?+pr.endPrice.units:null;
+    out.main=b?`NT$${a}–${b}`:`NT$${a} 以上`;
+  }else if(p.priceLevel && LEVEL[p.priceLevel]) out.main=LEVEL[p.priceLevel];
+  const o=p.parkingOptions;
+  if(o){
+    const t=[];
+    if(o.freeParkingLot||o.freeStreetParking||o.freeGarageParking) t.push("有免費車位");
+    if(o.paidParkingLot||o.paidStreetParking||o.paidGarageParking) t.push("收費");
+    if(o.valetParking) t.push("代客泊車");
+    out.po=t.join("、");
+  }
+  const texts=[];
+  if(p.editorialSummary) texts.push(String(p.editorialSummary));
+  (p.reviews||[]).forEach(r=>{ const x=r.text; if(x) texts.push(String(x.text||x)); });
+  const re=/[^。！？!?\n，,]{0,14}(?:\d{1,3}\s*(?:元|塊|NT\$?)\s*[\/／]?\s*(?:每)?\s*(?:小時|時|hr|H|次|天|日|月|半小時|30\s*分)|(?:每|一)\s*(?:小時|時|半小時|次|天)\s*(?:NT\$?)?\s*\d{1,3}\s*元?|(?:NT\$|\$)\s*\d{1,3}\s*[\/／]\s*(?:hr|h|小時|時))[^。！？!?\n，,]{0,10}/gi;
+  const seen=new Set();
+  texts.forEach(s=>{ (s.match(re)||[]).forEach(m=>{ m=m.trim(); if(m && !seen.has(m) && out.hints.length<3){ seen.add(m); out.hints.push(m); } }); });
+  return out;
+}
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let map, Place, markers = [], me = null, all = [], ready = null;
+
+function getKey(){ try{ return API_KEY || localStorage.getItem("gmkey") || ""; }catch(e){ return API_KEY; } }
+
+function loadGoogle(key){
+  return new Promise((res,rej)=>{
+    if(window.google && google.maps) return res();
+    window.__gm = res;
+    window.gm_authFailure = () => { $('status').textContent="金鑰驗證失敗：請確認已啟用 Maps JavaScript API、Places API (New)、已開通計費，且網址符合金鑰限制。"; };
+    const s=document.createElement('script');
+    s.src=`https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&loading=async&v=weekly&language=zh-TW&region=TW&callback=__gm`;
+    s.onerror=()=>rej(new Error("load"));
+    document.head.appendChild(s);
+  });
+}
+function init(){
+  if(ready) return ready;
+  const key=getKey();
+  if(!key){ $('keybox').style.display="block"; return Promise.reject(new Error("nokey")); }
+  $('keybox').style.display="none";
+  ready = loadGoogle(key).then(async()=>{
+    const {Map}=await google.maps.importLibrary("maps");
+    ({Place}=await google.maps.importLibrary("places"));
+    map=new Map($('map'),{center:{lat:25.0478,lng:121.5170},zoom:15,mapTypeControl:false,streetViewControl:false});
+  });
+  return ready;
+}
+
+function dist(a,b,c,d){const R=6371000,t=x=>x*Math.PI/180;
+  const h=Math.sin(t(c-a)/2)**2+Math.cos(t(a))*Math.cos(t(c))*Math.sin(t(d-b)/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));}
+
+function is24h(p){
+  const per=p.regularOpeningHours?.periods;
+  if(!per||!per.length) return false;
+  if(per.length===1 && per[0].open && !per[0].close) return true;
+  return per.length>=7 && per.every(x=>x.open && x.close && x.open.hour===0 && x.open.minute===0 && x.close.hour===0 && x.close.minute===0);
+}
+function isOpenNow(p){
+  try{ return p.regularOpeningHours?.isOpen?.() ?? null; }catch(e){ return null; }
+}
+function todayHours(p){
+  const w=p.regularOpeningHours?.weekdayDescriptions;
+  return w ? w[(new Date().getDay()+6)%7] : "";
+}
+function isParking(p){
+  return (p.types||[]).includes("parking") || /停車|parking|車場/i.test(p.displayName||"");
+}
+
+async function search(lat,lon){
+  try{ await init(); }catch(e){ if(e.message==="load") $('status').textContent="Google 地圖載入失敗，請檢查網路。"; return; }
+  me={lat,lng:lon};
+  const R=+$('radius').value;
+  $('status').textContent="搜尋中…"; $('list').innerHTML="";
+  const d=R/111320, dl=d/Math.cos(lat*Math.PI/180);
+  try{
+    const near=Place.searchNearby({fields:FIELDS,locationRestriction:{center:me,radius:R},
+      includedPrimaryTypes:["parking"],maxResultCount:20,language:"zh-TW",region:"tw",rankPreference:"DISTANCE"}).catch(()=>({places:[]}));
+    const txt=Place.searchByText({fields:FIELDS,textQuery:"停車場",
+      locationRestriction:{north:lat+d,south:lat-d,east:lon+dl,west:lon-dl},
+      maxResultCount:20,language:"zh-TW",region:"tw"}).catch(()=>({places:[]}));
+    const rs=await Promise.all([near,txt]);
+    const seen=new Set(); all=[];
+    rs.flatMap(r=>r.places||[]).forEach(p=>{
+      if(!p.location||seen.has(p.id)||p.businessStatus==="CLOSED_PERMANENTLY"||!isParking(p)) return;
+      seen.add(p.id);
+      const dd=dist(lat,lon,p.location.lat(),p.location.lng());
+      if(dd>R*1.05) return;
+      all.push({p,d:dd});
+    });
+    render();
+  }catch(e){
+    $('status').textContent="查詢失敗：請確認金鑰已啟用 Places API (New) 並開通計費。";
+  }
+}
+
+function render(){
+  const kind=$('kind').value, sort=$('sort').value;
+  let rows=all.filter(s=>kind==="24h"?is24h(s.p):kind==="open"?isOpenNow(s.p)!==false:true);
+  rows.sort(sort==="r"?((a,b)=>(b.p.rating||0)-(a.p.rating||0)):((a,b)=>(a.d??1e9)-(b.d??1e9)));
+  markers.forEach(m=>m.setMap(null)); markers=[];
+  const bounds=new google.maps.LatLngBounds();
+  if(me){
+    markers.push(new google.maps.Marker({map,position:me,title:"你的位置",
+      icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:"#1565c0",fillOpacity:1,strokeColor:"#fff",strokeWeight:2}}));
+    bounds.extend(me);
+  }
+  const ul=$('list'); ul.innerHTML="";
+  rows.forEach(s=>{
+    const p=s.p, pos={lat:p.location.lat(),lng:p.location.lng()};
+    markers.push(new google.maps.Marker({map,position:pos,title:p.displayName,label:"P"})); bounds.extend(pos);
+    const dm=s.d==null?"":(s.d<1000?Math.round(s.d)+" 公尺":(s.d/1000).toFixed(1)+" 公里");
+    const ph=p.nationalPhoneNumber||"";
+    const hrs=todayHours(p), open=isOpenNow(p);
+    const pi=priceInfo(p);
+    const priceHtml=(pi.main||pi.po||pi.hints.length)
+      ? `<div class="meta">💰 ${pi.main?`<span class="price">${esc(pi.main)}</span> `:""}${esc(pi.po)}</div>`
+        +(pi.hints.length?`<div class="meta">💬 網友提到（參考）：${pi.hints.map(h=>`<span class="price">${esc(h)}</span>`).join("；")}</div>`:"")
+      : `<div class="meta">💰 費率 Google 未提供，點下方「Google 地圖」看評論或現場告示</div>`;
+    const li=document.createElement('li');
+    li.innerHTML=`<h3>${esc(p.displayName||"")}</h3>
+      <div class="meta">${dm?`<span class="tag">${dm}</span>`:""}${is24h(p)?`<span class="tag g">24 小時</span>`:""}${open===true?`<span class="tag g">營業中</span>`:open===false?`<span class="tag">已打烊</span>`:""}${p.rating?`⭐ ${p.rating}（${p.userRatingCount||0}）`:""}</div>
+      ${priceHtml}
+      ${p.formattedAddress?`<div class="meta">📍 ${esc(p.formattedAddress)}</div>`:""}
+      ${hrs?`<div class="meta">🕒 ${esc(hrs)}</div>`:""}
+      ${ph?`<div class="meta">📞 ${esc(ph)}</div>`:""}
+      <div class="acts">
+        <a target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${pos.lat},${pos.lng}">導航</a>
+        <a class="o" target="_blank" rel="noopener" href="${esc(p.googleMapsURI||'#')}">Google 地圖／費率評價</a>
+        ${ph?`<a class="o" href="tel:${esc(ph.replace(/[^\d+]/g,''))}">撥打電話</a>`:""}
+      </div>`;
+    ul.appendChild(li);
+  });
+  if(!bounds.isEmpty()) map.fitBounds(bounds,40);
+  $('status').textContent=rows.length?`找到 ${rows.length} 個停車場${me?"":""}`:"這個範圍沒有符合的停車場，試試放大距離或取消篩選。";
+}
+
+function locate(){
+  if(!navigator.geolocation){$('status').textContent="此瀏覽器不支援定位，請輸入地點。";return}
+  $('status').textContent="定位中…";
+  navigator.geolocation.getCurrentPosition(p=>search(p.coords.latitude,p.coords.longitude),
+    ()=>{$('status').textContent="無法取得定位，請允許位置權限或直接輸入地點。"},{enableHighAccuracy:true,timeout:10000});
+}
+async function byText(){
+  const v=$('q').value.trim(); if(!v) return locate();
+  try{ await init(); }catch(e){ return; }
+  $('status').textContent="搜尋中…"; $('list').innerHTML="";
+  try{
+    const {places}=await Place.searchByText({textQuery:v,fields:FIELDS,maxResultCount:10,language:"zh-TW",region:"tw"});
+    if(!places.length){$('status').textContent="找不到這個地點，換個關鍵字試試。";return}
+    const first=places[0];
+    if(isParking(first)){
+      // 輸入的是停車場名稱：直接列出符合者
+      const seen=new Set(); all=[];
+      me=null;
+      places.forEach(p=>{
+        if(!p.location||seen.has(p.id)||!isParking(p)||p.businessStatus==="CLOSED_PERMANENTLY") return;
+        seen.add(p.id); all.push({p,d:null});
+      });
+      render();
+    }else{
+      // 地點模式：以該地點為中心找附近停車場
+      search(first.location.lat(),first.location.lng());
+    }
+  }catch(e){$('status').textContent="查詢失敗：請確認金鑰已啟用 Places API (New) 並開通計費。"}
+}
+
+$('loc').onclick=locate; $('go').onclick=byText;
+$('q').addEventListener('keydown',e=>{if(e.key==='Enter')byText()});
+$('kind').onchange=$('sort').onchange=()=>{if(all.length)render()};
+$('radius').onchange=()=>{if(me)search(me.lat,me.lng)};
+$('savekey').onclick=()=>{
+  const k=$('key').value.trim(); if(!k) return;
+  try{localStorage.setItem("gmkey",k)}catch(e){}
+  ready=null; init().then(()=>{$('status').textContent="金鑰已儲存，按「📍 我附近」開始。"}).catch(()=>{});
+};
+if(!getKey()) $('keybox').style.display="block"; else init().catch(()=>{});
+</script>
+</body>
+</html>

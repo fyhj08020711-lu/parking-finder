@@ -72,7 +72,7 @@ li h3{margin:0 0 4px;font-size:17px}
 
 <div id="map"></div>
 <div id="status">按「📍 我附近」或輸入地點開始搜尋</div>
-<div class="note">資料來源：Google 地圖。價格取自 Google 的價位資料，以及簡介／評論中提到的費率（網友說法，可能過時，僅供參考）；Google 沒有的就無法顯示，實際收費以現場告示為準。剩餘車位 Google 不提供。</div>
+<div class="note">資料來源：Google 地圖。臺北市範圍會顯示臺北市官方公布的費率與即時空位；其他地區取自 Google 價位資料與評論中網友提到的費率（可能過時，僅供參考）。實際收費以現場告示為準。</div>
 <ul id="list"></ul>
 
 <script>
@@ -160,6 +160,71 @@ function isParking(p){
   return (p.types||[]).includes("parking") || /停車|parking|車場/i.test(p.displayName||"");
 }
 
+// ===== 台北市停車場開放資料（有官方費率與即時空位）=====
+let tpePromise=null;
+function twd97(x,y){ // TWD97 TM2(121) -> WGS84
+  const a=6378137,f=1/298.257222101,k0=0.9999,e2=2*f-f*f,ep2=e2/(1-e2);
+  const M=y/k0, mu=M/(a*(1-e2/4-3*e2*e2/64-5*e2**3/256));
+  const e1=(1-Math.sqrt(1-e2))/(1+Math.sqrt(1-e2));
+  const p=mu+(3*e1/2-27*e1**3/32)*Math.sin(2*mu)+(21*e1*e1/16-55*e1**4/32)*Math.sin(4*mu)+(151*e1**3/96)*Math.sin(6*mu);
+  const sn=Math.sin(p),cs=Math.cos(p),tn=Math.tan(p);
+  const C1=ep2*cs*cs,T1=tn*tn,N1=a/Math.sqrt(1-e2*sn*sn),R1=a*(1-e2)/Math.pow(1-e2*sn*sn,1.5),D=(x-250000)/(N1*k0);
+  const lat=p-(N1*tn/R1)*(D*D/2-(5+3*T1+10*C1-4*C1*C1-9*ep2)*D**4/24);
+  const lon=(D-(1+2*T1+C1)*D**3/6+(5-2*C1+28*T1-3*C1*C1+8*ep2+24*T1*T1)*D**5/120)/cs;
+  return {lat:lat*180/Math.PI,lng:121+lon*180/Math.PI};
+}
+function loadTpe(){
+  if(tpePromise) return tpePromise;
+  tpePromise=(async()=>{
+    try{
+      const base="https://tcgbusfs.blob.core.windows.net/blobtcmsv/";
+      const [d,a]=await Promise.all([fetch(base+"TCMSV_alldesc.json").then(r=>r.json()),
+        fetch(base+"TCMSV_allavailable.json").then(r=>r.json()).catch(()=>null)]);
+      const av={}; (a?.data?.park||[]).forEach(x=>av[x.id]=x);
+      return (d.data.park||[]).map(x=>{
+        let lat=NaN,lng=NaN;
+        const e=x.EntranceCoord?.EntrancecoordInfo?.[0];
+        if(e && +e.Xcod>20 && +e.Ycod>100){ lat=+e.Xcod; lng=+e.Ycod; }
+        else if(+x.tw97x>0){ const c=twd97(+x.tw97x,+x.tw97y); lat=c.lat; lng=c.lng; }
+        return {id:x.id,name:x.name,address:x.address,tel:x.tel,payex:x.payex,serviceTime:x.serviceTime,
+          type:x.type2,summary:x.summary,lat,lng,availCar:av[x.id]?.availablecar};
+      }).filter(x=>isFinite(x.lat)&&isFinite(x.lng));
+    }catch(e){ return []; }
+  })();
+  return tpePromise;
+}
+const nm=s=>String(s||"").replace(/[（(].*?[）)]/g,"").replace(/停車場|停車塔|停車|地下|地面|立體|公有|民營|路外|臨時|\s/g,"");
+function sameName(a,b){
+  a=nm(a); b=nm(b); if(!a||!b) return false;
+  if(a.includes(b)||b.includes(a)) return true;
+  for(let i=0;i+3<=a.length;i++) if(b.includes(a.slice(i,i+3))) return true;
+  return false;
+}
+// 把官方資料配對到 Google 結果；搜尋模式下，Google 沒列到的官方停車場也補進來
+async function enrich(items,center,R){
+  const tpe=await loadTpe(); if(!tpe.length) return items;
+  const used=new Set();
+  items.forEach(s=>{
+    if(!s.p) return;
+    const la=s.p.location.lat(),lo=s.p.location.lng();
+    let best=null,bd=1e9;
+    tpe.forEach(t=>{
+      if(Math.abs(t.lat-la)>0.003||Math.abs(t.lng-lo)>0.003) return;
+      const dd=dist(la,lo,t.lat,t.lng);
+      if(dd<bd && (dd<40 || (dd<150 && sameName(s.p.displayName,t.name)))){ bd=dd; best=t; }
+    });
+    if(best){ s.t=best; used.add(best.id); }
+  });
+  if(center){
+    tpe.forEach(t=>{
+      if(used.has(t.id)) return;
+      const dd=dist(center.lat,center.lng,t.lat,t.lng);
+      if(dd<=R*1.05) items.push({p:null,t,d:dd});
+    });
+  }
+  return items;
+}
+
 async function search(lat,lon){
   try{ await init(); }catch(e){ if(e.message==="load") $('status').textContent="Google 地圖載入失敗，請檢查網路。"; return; }
   me={lat,lng:lon};
@@ -181,16 +246,19 @@ async function search(lat,lon){
       if(dd>R*1.05) return;
       all.push({p,d:dd});
     });
+    await enrich(all,me,R);
     render();
   }catch(e){
     $('status').textContent="查詢失敗：請確認金鑰已啟用 Places API (New) 並開通計費。";
   }
 }
 
+const is24Item=s=>(s.p&&is24h(s.p))||(s.t&&/^00:00(:00)?-23:59/.test(s.t.serviceTime||""));
+
 function render(){
   const kind=$('kind').value, sort=$('sort').value;
-  let rows=all.filter(s=>kind==="24h"?is24h(s.p):kind==="open"?isOpenNow(s.p)!==false:true);
-  rows.sort(sort==="r"?((a,b)=>(b.p.rating||0)-(a.p.rating||0)):((a,b)=>(a.d??1e9)-(b.d??1e9)));
+  let rows=all.filter(s=>kind==="24h"?is24Item(s):kind==="open"?(s.p?isOpenNow(s.p)!==false:true):true);
+  rows.sort(sort==="r"?((a,b)=>(b.p?.rating||0)-(a.p?.rating||0)):((a,b)=>(a.d??1e9)-(b.d??1e9)));
   markers.forEach(m=>m.setMap(null)); markers=[];
   const bounds=new google.maps.LatLngBounds();
   if(me){
@@ -200,32 +268,44 @@ function render(){
   }
   const ul=$('list'); ul.innerHTML="";
   rows.forEach(s=>{
-    const p=s.p, pos={lat:p.location.lat(),lng:p.location.lng()};
-    markers.push(new google.maps.Marker({map,position:pos,title:p.displayName,label:"P"})); bounds.extend(pos);
+    const p=s.p, t=s.t;
+    const pos=p?{lat:p.location.lat(),lng:p.location.lng()}:{lat:t.lat,lng:t.lng};
+    const name=p?.displayName||t.name;
+    markers.push(new google.maps.Marker({map,position:pos,title:name,label:"P"})); bounds.extend(pos);
     const dm=s.d==null?"":(s.d<1000?Math.round(s.d)+" 公尺":(s.d/1000).toFixed(1)+" 公里");
-    const ph=p.nationalPhoneNumber||"";
-    const hrs=todayHours(p), open=isOpenNow(p);
-    const pi=priceInfo(p);
-    const priceHtml=(pi.main||pi.po||pi.hints.length)
-      ? `<div class="meta">💰 ${pi.main?`<span class="price">${esc(pi.main)}</span> `:""}${esc(pi.po)}</div>`
-        +(pi.hints.length?`<div class="meta">💬 網友提到（參考）：${pi.hints.map(h=>`<span class="price">${esc(h)}</span>`).join("；")}</div>`:"")
-      : `<div class="meta">💰 費率 Google 未提供，點下方「Google 地圖」看評論或現場告示</div>`;
+    const ph=p?.nationalPhoneNumber||(t?.tel?("02-"+t.tel.replace(/^02-?/,"")):"");
+    const hrs=p?todayHours(p):"", open=p?isOpenNow(p):null;
+    const pi=p?priceInfo(p):{main:"",po:"",hints:[]};
+    let priceHtml="";
+    if(t&&t.payex){
+      priceHtml=`<div class="meta">💰 <span class="price">${esc(t.payex)}</span> <small>（臺北市官方資料）</small></div>`;
+    }else if(pi.main||pi.po||pi.hints.length){
+      priceHtml=`<div class="meta">💰 ${pi.main?`<span class="price">${esc(pi.main)}</span> `:""}${esc(pi.po)}</div>`
+        +(pi.hints.length?`<div class="meta">💬 網友提到（參考）：${pi.hints.map(h=>`<span class="price">${esc(h)}</span>`).join("；")}</div>`:"");
+    }else{
+      priceHtml=`<div class="meta">💰 這裡沒有公開費率資料，請點「Google 地圖」看評論或現場告示</div>`;
+    }
+    if(pi.hints.length && t&&t.payex) priceHtml+=`<div class="meta">💬 網友提到（參考）：${pi.hints.map(h=>`<span class="price">${esc(h)}</span>`).join("；")}</div>`;
+    const avail=(t&&t.availCar>=0)?`<span class="tag g">空位 ${t.availCar} 格（即時）</span>`:"";
+    const addr=p?.formattedAddress||t?.address||"";
+    const gmap=p?.googleMapsURI||`https://www.google.com/maps/search/?api=1&query=${pos.lat},${pos.lng}`;
     const li=document.createElement('li');
-    li.innerHTML=`<h3>${esc(p.displayName||"")}</h3>
-      <div class="meta">${dm?`<span class="tag">${dm}</span>`:""}${is24h(p)?`<span class="tag g">24 小時</span>`:""}${open===true?`<span class="tag g">營業中</span>`:open===false?`<span class="tag">已打烊</span>`:""}${p.rating?`⭐ ${p.rating}（${p.userRatingCount||0}）`:""}</div>
+    li.innerHTML=`<h3>${esc(name)}</h3>
+      <div class="meta">${dm?`<span class="tag">${dm}</span>`:""}${is24Item(s)?`<span class="tag g">24 小時</span>`:""}${avail}${open===true?`<span class="tag g">營業中</span>`:open===false?`<span class="tag">已打烊</span>`:""}${p?.rating?`⭐ ${p.rating}（${p.userRatingCount||0}）`:""}</div>
       ${priceHtml}
-      ${p.formattedAddress?`<div class="meta">📍 ${esc(p.formattedAddress)}</div>`:""}
-      ${hrs?`<div class="meta">🕒 ${esc(hrs)}</div>`:""}
+      ${t&&t.summary?`<div class="meta">🚗 ${esc(t.summary)}</div>`:""}
+      ${addr?`<div class="meta">📍 ${esc(addr)}</div>`:""}
+      ${hrs?`<div class="meta">🕒 ${esc(hrs)}</div>`:(t&&t.serviceTime?`<div class="meta">🕒 ${esc(t.serviceTime.replace(/:00(?=-|$)/g,""))}</div>`:"")}
       ${ph?`<div class="meta">📞 ${esc(ph)}</div>`:""}
       <div class="acts">
         <a target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${pos.lat},${pos.lng}">導航</a>
-        <a class="o" target="_blank" rel="noopener" href="${esc(p.googleMapsURI||'#')}">Google 地圖／費率評價</a>
+        <a class="o" target="_blank" rel="noopener" href="${esc(gmap)}">Google 地圖／評價</a>
         ${ph?`<a class="o" href="tel:${esc(ph.replace(/[^\d+]/g,''))}">撥打電話</a>`:""}
       </div>`;
     ul.appendChild(li);
   });
   if(!bounds.isEmpty()) map.fitBounds(bounds,40);
-  $('status').textContent=rows.length?`找到 ${rows.length} 個停車場${me?"":""}`:"這個範圍沒有符合的停車場，試試放大距離或取消篩選。";
+  $('status').textContent=rows.length?`找到 ${rows.length} 個停車場`:"這個範圍沒有符合的停車場，試試放大距離或取消篩選。";
 }
 
 function locate(){
@@ -250,6 +330,7 @@ async function byText(){
         if(!p.location||seen.has(p.id)||!isParking(p)||p.businessStatus==="CLOSED_PERMANENTLY") return;
         seen.add(p.id); all.push({p,d:null});
       });
+      await enrich(all,null,0);
       render();
     }else{
       // 地點模式：以該地點為中心找附近停車場

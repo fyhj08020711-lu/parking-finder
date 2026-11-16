@@ -72,7 +72,7 @@ li h3{margin:0 0 4px;font-size:17px}
 
 <div id="map"></div>
 <div id="status">按「📍 我附近」或輸入地點開始搜尋</div>
-<div class="note">資料來源：Google 地圖。臺北市範圍會顯示臺北市官方公布的費率與即時空位；其他地區取自 Google 價位資料與評論中網友提到的費率（可能過時，僅供參考）。實際收費以現場告示為準。</div>
+<div class="note">資料來源：Google 地圖。臺北市範圍會顯示臺北市官方公布的費率與即時空位；其他地區取自 Google 價位資料與評論中網友提到的費率（可能過時）；完全沒資料的停車場會用附近停車場的費率推估一個大概價（標示「推估」）。皆僅供參考，實際收費以現場告示為準。</div>
 <ul id="list"></ul>
 
 <script>
@@ -100,12 +100,15 @@ function priceInfo(p){
     if(o.valetParking) t.push("代客泊車");
     out.po=t.join("、");
   }
-  const texts=[];
-  if(p.editorialSummary) texts.push(String(p.editorialSummary));
-  (p.reviews||[]).forEach(r=>{ const x=r.text; if(x) texts.push(String(x.text||x)); });
+  // 依評論時間由新到舊挖費率（最新的排最前面），每則標上評論時間
   const re=/[^。！？!?\n，,]{0,14}(?:\d{1,3}\s*(?:元|塊|NT\$?)\s*[\/／]?\s*(?:每)?\s*(?:小時|時|hr|H|次|天|日|月|半小時|30\s*分)|(?:每|一)\s*(?:小時|時|半小時|次|天)\s*(?:NT\$?)?\s*\d{1,3}\s*元?|(?:NT\$|\$)\s*\d{1,3}\s*[\/／]\s*(?:hr|h|小時|時))[^。！？!?\n，,]{0,10}/gi;
+  const ts=r=>{ const d=r.publishTime; return d&&d.getTime?d.getTime():0; };
+  const fmt=r=>{ const d=r.publishTime; return d&&d.getTime?`${d.getFullYear()}/${d.getMonth()+1} 評論`:(r.relativePublishTimeDescription||""); };
+  const revs=(p.reviews||[]).filter(r=>r.text).slice().sort((a,b)=>ts(b)-ts(a));
   const seen=new Set();
-  texts.forEach(s=>{ (s.match(re)||[]).forEach(m=>{ m=m.trim(); if(m && !seen.has(m) && out.hints.length<3){ seen.add(m); out.hints.push(m); } }); });
+  const add=(str,when)=>{ (String(str).match(re)||[]).forEach(m=>{ m=m.trim(); if(m && !seen.has(m) && out.hints.length<3){ seen.add(m); out.hints.push({t:m,when}); } }); };
+  revs.forEach(r=>add(String(r.text.text||r.text),fmt(r)));
+  if(p.editorialSummary) add(String(p.editorialSummary.text||p.editorialSummary),"Google 簡介");
   return out;
 }
 
@@ -253,6 +256,31 @@ async function search(lat,lon){
   }
 }
 
+// ===== 推估：沒有任何費率資料的停車場，用附近有資料的停車場的小時費率中位數估算 =====
+function hourlyOf(s){
+  const t=s.t, p=s.p;
+  if(t&&t.payex){
+    const m=t.payex.match(/(?:計時|小型車|汽車)[^0-9機]{0,6}(\d{1,3})\s*元\s*[\/／]\s*(?:小)?時/)||t.payex.match(/^[^機]*?(\d{1,3})\s*元\s*[\/／]\s*(?:小)?時/);
+    if(m) return +m[1];
+  }
+  if(p){
+    for(const h of priceInfo(p).hints){
+      if(/機車|摩托/.test(h.t)) continue;
+      const m=h.t.match(/(\d{1,3})\s*(?:元|塊|NT\$?)?\s*[\/／每]?\s*(?:小時|時|hr|h)/i)||h.t.match(/(?:每|一)\s*(?:小)?時\s*(?:NT\$?)?\s*(\d{1,3})/);
+      if(m){ const v=+m[1]; if(v>=10&&v<=300) return v; }
+    }
+  }
+  return null;
+}
+function locOf(s){ return s.p?{lat:s.p.location.lat(),lng:s.p.location.lng()}:{lat:s.t.lat,lng:s.t.lng}; }
+function estimateFor(s,known){
+  const me_=locOf(s);
+  const near=known.filter(k=>k.s!==s&&dist(me_.lat,me_.lng,k.lat,k.lng)<=800).map(k=>k.v).sort((a,b)=>a-b);
+  if(near.length<2) return null;
+  const mid=near[Math.floor(near.length/2)];
+  return {v:Math.round(mid/5)*5,n:near.length};
+}
+
 const is24Item=s=>(s.p&&is24h(s.p))||(s.t&&/^00:00(:00)?-23:59/.test(s.t.serviceTime||""));
 
 function render(){
@@ -266,6 +294,7 @@ function render(){
       icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:"#1565c0",fillOpacity:1,strokeColor:"#fff",strokeWeight:2}}));
     bounds.extend(me);
   }
+  const known=[]; all.forEach(x=>{ const v=hourlyOf(x); if(v!=null){ const l=locOf(x); known.push({s:x,v,lat:l.lat,lng:l.lng}); } });
   const ul=$('list'); ul.innerHTML="";
   rows.forEach(s=>{
     const p=s.p, t=s.t;
@@ -281,11 +310,14 @@ function render(){
       priceHtml=`<div class="meta">💰 <span class="price">${esc(t.payex)}</span> <small>（臺北市官方資料）</small></div>`;
     }else if(pi.main||pi.po||pi.hints.length){
       priceHtml=`<div class="meta">💰 ${pi.main?`<span class="price">${esc(pi.main)}</span> `:""}${esc(pi.po)}</div>`
-        +(pi.hints.length?`<div class="meta">💬 網友提到（參考）：${pi.hints.map(h=>`<span class="price">${esc(h)}</span>`).join("；")}</div>`:"");
+        +(pi.hints.length?`<div class="meta">💬 網友提到（最新評論優先，參考）：${pi.hints.map(h=>`<span class="price">${esc(h.t)}</span>${h.when?` <small>（${esc(h.when)}）</small>`:""}`).join("；")}</div>`:"");
     }else{
-      priceHtml=`<div class="meta">💰 這裡沒有公開費率資料，請點「Google 地圖」看評論或現場告示</div>`;
+      const est=estimateFor(s,known);
+      priceHtml=est
+        ?`<div class="meta">💰 <span class="price">約 NT$${est.v}／小時</span> <small>（推估：依附近 ${est.n} 間停車場的費率，非實際收費，僅供參考）</small></div>`
+        :`<div class="meta">💰 這裡沒有公開費率資料，也湊不到附近的參考價，請點「Google 地圖」看評論或現場告示</div>`;
     }
-    if(pi.hints.length && t&&t.payex) priceHtml+=`<div class="meta">💬 網友提到（參考）：${pi.hints.map(h=>`<span class="price">${esc(h)}</span>`).join("；")}</div>`;
+    if(pi.hints.length && t&&t.payex) priceHtml+=`<div class="meta">💬 網友提到（最新評論優先，參考）：${pi.hints.map(h=>`<span class="price">${esc(h.t)}</span>${h.when?` <small>（${esc(h.when)}）</small>`:""}`).join("；")}</div>`;
     const avail=(t&&t.availCar>=0)?`<span class="tag g">空位 ${t.availCar} 格（即時）</span>`:"";
     const addr=p?.formattedAddress||t?.address||"";
     const gmap=p?.googleMapsURI||`https://www.google.com/maps/search/?api=1&query=${pos.lat},${pos.lng}`;
